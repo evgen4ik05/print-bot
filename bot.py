@@ -1,24 +1,41 @@
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
 # ==================== НАЛАШТУВАННЯ ====================
 BOT_TOKEN = "8979591910:AAHL-MhsL81G7IxKrLBkUOOhQVeD1lQXSXg"
 ADMIN_ID = 6765881520  # Твій числовий ID
-REKVIZITY = "4441114409323761" # Твоя картка або лінк на банку
+REKVIZITY = "4441114409323761" # Тільки голі цифри картки!
 # ======================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Сортувальний пункт для медіагруп (альбомів)
+# --- ОБХІД ТАЙМАУТУ RENDER (МІКРО-ВЕБСЕРВЕР) ---
+async def handle_root(request):
+    return web.Response(text="Bot is running live!")
+
+async def start_webserver():
+    app = web.Application()
+    app.router.add_get('/', handle_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render сам передає порт у змінну оточення PORT, якщо її немає — беремо 8080
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Micro-webserver started on port {port}")
+
+# --- МІДЛВАР ДЛЯ МЕДІАГРУП ---
 class MediaGroupMiddleware(BaseMiddleware):
     def __init__(self, latency: float = 0.6):
         self.latency = latency
@@ -37,14 +54,13 @@ class MediaGroupMiddleware(BaseMiddleware):
 
 dp.message.middleware(MediaGroupMiddleware())
 
-# Стани для клієнта та адміна
 class PrintingForm(StatesGroup):
     waiting_for_color = State()
     waiting_for_type = State()
     waiting_for_files = State()
 
 class AdminForm(StatesGroup):
-    waiting_for_price = State() # Стан, коли адмін вводить суму
+    waiting_for_price = State()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -85,8 +101,8 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
     builder.button(text="📥 Надіслати замовлення", callback_data="send_all_files")
     
     await callback.message.answer(
-        "📎 <b>Надсилай файли для друку</b> (документи, фото, презентації).\n\n"
-        "Можна кидати як по одному, так і пачками. Коли завантажиш усе — тисни кнопку👇",
+        "📎 <b>Надсилай файли для друку</b> (документи, photo, презентації).\n\n"
+        "Коли завантажиш усе — тисни кнопку👇",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
@@ -129,6 +145,7 @@ async def process_incoming_files(message: types.Message, state: FSMContext, albu
             parse_mode="HTML",
             reply_markup=builder.as_markup()
         )
+        await state.set_state(PrintingForm.waiting_for_files)
         await state.update_data(last_msg_id=sent_msg.message_id)
     else:
         await message.answer("⚠️ Надішли документ, фото або відео.")
@@ -165,7 +182,6 @@ async def send_order_to_admin(callback: types.CallbackQuery, state: FSMContext):
     
     for index, file_info in enumerate(file_list, start=1):
         builder = InlineKeyboardBuilder()
-        # Об'єднана кнопка під НАЙОСТАННІШИМ файлом
         if index == len(file_list):
             builder.button(text="💰 Виконано (Ввести суму)", callback_data=f"orderdone_{callback.from_user.id}")
             
@@ -179,19 +195,14 @@ async def send_order_to_admin(callback: types.CallbackQuery, state: FSMContext):
         elif file_info["type"] == "video":
             await bot.send_video(chat_id=ADMIN_ID, video=fid, caption=caption_text, reply_markup=builder.as_markup())
 
-# Адмін натиснув кнопку виконання
 @dp.callback_query(F.data.startswith("orderdone_"))
 async def admin_click_done(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     student_id = callback.data.split("_")[1]
-    
-    # Вмикаємо режим очікування суми від адміна
     await state.set_state(AdminForm.waiting_for_price)
     await state.update_data(target_student_id=student_id, admin_msg_to_edit=callback.message)
-    
     await bot.send_message(chat_id=ADMIN_ID, text="💰 Введіть загальну суму до оплати (просто цифрами):")
 
-# Обробка введеної адміном суми
 @dp.message(AdminForm.waiting_for_price)
 async def process_admin_price(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -205,38 +216,31 @@ async def process_admin_price(message: types.Message, state: FSMContext):
     await state.clear()
     
     try:
-        # Надіслати повне комбо-сповіщення студенту
         await bot.send_message(
             chat_id=student_id, 
             text=f"🎉 <b>Твоє замовлення готове!</b>\nМожеш підходити й забирати роздруківки.\n\n"
                  f"💰 <b>До оплати:</b> {price} грн\n"
-                 f"📌 <b>Реквізити:</b> Картка: <code>{REKVIZITY}</code>\n",
+                 f"📌 <b>Реквізити:</b> Картка: <code>{REKVIZITY}</code>",
             parse_mode="HTML"
         )
         await message.answer(f"✅ Студенту надіслано рахунок на {price} грн, замовлення закрито!")
-        
-        # Оновлюємо підпис під твоїм файлом, щоб бачити, що все виконано
         await msg_to_edit.edit_caption(
             caption=msg_to_edit.caption + f"\n\n✅ <b>ВИКОНАНО (Рахунок: {price} грн)</b>", 
             parse_mode="HTML"
         )
     except Exception as e:
-        await message.answer(f"❌ Не вдалося надіслати сповіщення студенту. Можливо, він заблокував бота.")
+        await message.answer(f"❌ Не вдалося надіслати сповіщення.")
 
-# Функція, яка автоматично створить кнопку "Старт" в меню Telegram
 async def set_main_menu(bot: Bot):
     main_menu_commands = [
-        types.BotCommand(
-            command="/start",
-            description="🤖 Запустити бота / Створити замовлення"
-        )
+        types.BotCommand(command="/start", description="🤖 Запустити бота / Створити замовлення")
     ]
     await bot.set_my_commands(main_menu_commands)
 
 async def main():
-    # Запускаємо налаштування кнопки меню перед початком опитування
     await set_main_menu(bot)
-    
+    # Запускаємо вебсервер паралельно з ботом
+    await start_webserver()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
